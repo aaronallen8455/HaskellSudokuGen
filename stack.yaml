@@ -41,9 +41,6 @@ packages:
 # (e.g., acme-missiles-0.3)
 extra-deps:
 - random-1.1
-- async-2.1.1.1
-- stm-2.4.4.1
-- monad-par-0.3.4.8
 
 # Override default flag values for local packages and extra-deps
 flags: {}
