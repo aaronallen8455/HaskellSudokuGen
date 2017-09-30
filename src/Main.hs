@@ -8,7 +8,10 @@ import Control.Concurrent.Async
 import Control.Concurrent.MVar
 import Control.Exception (finally)
 import Data.IORef
+import Control.Monad.Par.IO
 
+
+-- could have a subfind that is in maybe monad and find function that folds subfind over each cell
 
 -- Make types for the cell and grid
 data Cell = Cell { coords :: (Int,Int)

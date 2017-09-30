@@ -21,4 +21,5 @@ executable SudokuGen
   build-depends:       base >= 4.7 && < 5,
                        array,
                        random,
-                       async
+                       async,
+                       monad-par
