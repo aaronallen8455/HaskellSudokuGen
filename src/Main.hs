@@ -1,3 +1,5 @@
+{-#LANGUAGE BangPatterns#-}
+
 import Data.List (transpose, groupBy, intersperse, sortBy)
 import qualified Data.Set as S (fromList, member)
 import Data.Array (Array, listArray, (!), elems, (//), assocs, array)
@@ -6,6 +8,8 @@ import Data.Maybe (fromJust, isJust, isNothing)
 import Control.Monad (when)
 import Data.Function (on)
 import System.IO (hSetBuffering, BufferMode (LineBuffering), stdout)
+import Control.Concurrent (MVar, newMVar, modifyMVar)
+import Control.Concurrent.Async (Async, withAsync, wait)
 
 -- Make types for the cell and grid
 data Cell = Cell { coords :: (Int,Int)
@@ -19,19 +23,37 @@ data Grid = Grid { cells :: Array (Int,Int) Cell
 
 type Group = [Cell]
 
--- could make the sorted rows array be a structure where a used cell has it's coords removed
+-- non-blocking semaphore
+newtype NBSem = NBSem (MVar Int)
+
+newNBSem :: Int -> IO NBSem
+newNBSem i = do
+  m <- newMVar i
+  return (NBSem m)
+
+tryAcquireNBSem :: NBSem -> IO Bool
+tryAcquireNBSem (NBSem m) =
+  modifyMVar m $ \i ->
+    if i == 0
+    then return (i, False)
+    else let !z = i-1 in return (z, True)
+
+releaseNBSem :: NBSem -> IO ()
+releaseNBSem (NBSem m) =
+  modifyMVar m $ \i ->
+    let !z = i+1 in return (z, ())
 
 -- the entry point where user enters the grid size and finished grid is printed
 main = do
   hSetBuffering stdout LineBuffering
   putStrLn "Enter the grid size."
   len <- readLn :: IO Int
-  when (len > 2) $ do
+  when (len > 1) $ do
     gen <- newStdGen
     let grid = initGrid len gen
         vals = take (len^2) values
         initBox = map (cells grid !) $ sortedRows grid ! 0
-        finishedGrid = fromJust $ find grid initBox vals
+    finishedGrid <- fromJust <$> find grid initBox vals
     printGrid finishedGrid
     main
 
@@ -48,6 +70,7 @@ initGrid size gen =
   in Grid cells size sortedRows
 
 
+-- creates of list of shuffled indexes for each row
 getSortedRows :: Int -> StdGen -> [[(Int,Int)]]
 getSortedRows size gen = do
   let randNums = randoms gen :: [Int]
@@ -71,7 +94,7 @@ assignCell g@(Grid arr size rows) c@(Cell coords _) val =
 
 
 -- see if the value can be assigned to the given cell
---canAssign :: Grid -> Cell -> Char -> Bool
+canAssign :: Grid -> Cell -> Char -> Bool
 canAssign (Grid cells size _) (Cell (cr,cc) cvalue) v
   | cvalue /= 'x' = False
   | otherwise =
@@ -83,23 +106,32 @@ canAssign (Grid cells size _) (Cell (cr,cc) cvalue) v
     in not $ S.member v row || S.member v col || S.member v box
 
 
-find :: Grid -> Group -> [Char] -> Maybe Grid
-find grid _ [] = Just grid
-find _ [] _ = Nothing
-find grid group values = do
-  r <- search group
-  return r
+-- iterate over the given group with the subFind function which tries to assign the current value to each cell in a given row
+find :: Grid -> Group -> [Char] -> IO (Maybe Grid)
+find grid _ [] = return (Just grid)
+find _ [] _ = return Nothing
+find grid group values =
+  foldr (subFind grid values) dowait group []
  where
-   search [] = Nothing
-   search (c:cs) =
-     case subFind grid c values of
-       g@(Just _) -> g
-       Nothing -> search cs
+   dowait as = loop as
 
-subFind :: Grid -> Cell -> [Char] -> Maybe Grid
-subFind grid@(Grid cells size rows) c@(Cell (row,col) _) values@(v:vals) = do
-  newGrid <- assignCell grid c v
-  let bound = size ^ 2 - 1
-  if row < bound
-  then find newGrid (map (cells !) $ rows ! (row + 1)) values
-  else find newGrid (map (cells !) $ rows ! 0) vals
+   loop [] = return Nothing
+   loop (a:as) = do
+     r <- wait a
+     case r of
+       Nothing -> loop as
+       g@(Just _) -> return g
+
+-- each fold of subFind will add an async to the list and call inner on it (which will be next subFind)
+-- then all the asyncs end up in dowait
+
+-- Tries to assign the current value to a given cell. If it succeeds, we either move to the next row or the next value at top row.
+-- If it fails, we fall back to the find function which will try the next cell.
+subFind :: Grid -> [Char] -> Cell -> ([Async (Maybe Grid)] -> IO (Maybe Grid)) -> [Async (Maybe Grid)] -> IO (Maybe Grid)
+subFind grid@(Grid cells size rows) values@(v:vals) c@(Cell (row,col) _) inner asyncs = do
+  case assignCell grid c v of
+    Nothing -> inner asyncs
+    Just g ->
+      if row < size ^ 2 - 1
+      then withAsync (find g (map (cells !) $ rows ! (row + 1)) values) $ \a -> inner (a:asyncs)
+      else withAsync (find g (map (cells !) $ rows ! 0) vals) $ \a -> inner (a:asyncs)
