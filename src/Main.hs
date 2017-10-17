@@ -1,4 +1,4 @@
-{-#LANGUAGE BangPatterns#-}
+{-# LANGUAGE BangPatterns #-}
 
 import Data.List (transpose, groupBy, intersperse, sortBy)
 import qualified Data.Set as S (fromList, member)
@@ -10,6 +10,7 @@ import Data.Function (on)
 import System.IO (hSetBuffering, BufferMode (LineBuffering), stdout)
 import Control.Concurrent (MVar, newMVar, modifyMVar)
 import Control.Concurrent.Async (Async, withAsync, wait)
+import Control.Exception (finally)
 
 -- Make types for the cell and grid
 data Cell = Cell { coords :: (Int,Int)
@@ -53,7 +54,8 @@ main = do
     let grid = initGrid len gen
         vals = take (len^2) values
         initBox = map (cells grid !) $ sortedRows grid ! 0
-    finishedGrid <- fromJust <$> find grid initBox vals
+    sem <- newNBSem 2
+    finishedGrid <- fromJust <$> find sem grid initBox vals
     printGrid finishedGrid
     main
 
@@ -107,11 +109,11 @@ canAssign (Grid cells size _) (Cell (cr,cc) cvalue) v
 
 
 -- iterate over the given group with the subFind function which tries to assign the current value to each cell in a given row
-find :: Grid -> Group -> [Char] -> IO (Maybe Grid)
-find grid _ [] = return (Just grid)
-find _ [] _ = return Nothing
-find grid group values =
-  foldr (subFind grid values) dowait group []
+find :: NBSem -> Grid -> Group -> [Char] -> IO (Maybe Grid)
+find _ grid _ [] = return (Just grid)
+find _ _ [] _ = return Nothing
+find sem grid group values =
+  foldr (subFind sem grid values) dowait group []
  where
    dowait as = loop as
 
@@ -127,11 +129,21 @@ find grid group values =
 
 -- Tries to assign the current value to a given cell. If it succeeds, we either move to the next row or the next value at top row.
 -- If it fails, we fall back to the find function which will try the next cell.
-subFind :: Grid -> [Char] -> Cell -> ([Async (Maybe Grid)] -> IO (Maybe Grid)) -> [Async (Maybe Grid)] -> IO (Maybe Grid)
-subFind grid@(Grid cells size rows) values@(v:vals) c@(Cell (row,col) _) inner asyncs = do
+subFind :: NBSem -> Grid -> [Char] -> Cell -> ([Async (Maybe Grid)] -> IO (Maybe Grid)) -> [Async (Maybe Grid)] -> IO (Maybe Grid)
+subFind sem grid@(Grid cells size rows) values@(v:vals) c@(Cell (row,col) _) inner asyncs = do
   case assignCell grid c v of
     Nothing -> inner asyncs
-    Just g ->
-      if row < size ^ 2 - 1
-      then withAsync (find g (map (cells !) $ rows ! (row + 1)) values) $ \a -> inner (a:asyncs)
-      else withAsync (find g (map (cells !) $ rows ! 0) vals) $ \a -> inner (a:asyncs)
+    Just g -> do
+      q <- tryAcquireNBSem sem
+      let nxt = row < size ^ 2 - 1
+      if q then do
+        let dofind | nxt = find sem g (map (cells !) $ rows ! (row + 1)) values `finally` releaseNBSem sem
+                   | otherwise = find sem g (map (cells !) $ rows ! 0) vals `finally` releaseNBSem sem
+        withAsync dofind $ \a -> inner (a:asyncs)
+      else do
+        g <- if nxt
+             then find sem g (map (cells !) $ rows ! (row + 1)) values
+             else find sem g (map (cells !) $ rows ! 0) vals
+        case g of
+          Nothing -> inner asyncs
+          Just _ -> return g
