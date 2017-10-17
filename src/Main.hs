@@ -44,6 +44,10 @@ releaseNBSem (NBSem m) =
   modifyMVar m $ \i ->
     let !z = i+1 in return (z, ())
 
+-- the depth at which concurrency starts
+depthGate :: Int
+depthGate = 23
+
 -- the entry point where user enters the grid size and finished grid is printed
 main = do
   hSetBuffering stdout LineBuffering
@@ -55,7 +59,7 @@ main = do
         vals = take (len^2) values
         initBox = map (cells grid !) $ sortedRows grid ! 0
     sem <- newNBSem 2
-    finishedGrid <- fromJust <$> find sem grid initBox vals
+    finishedGrid <- fromJust <$> find sem 0 grid initBox vals
     printGrid finishedGrid
     main
 
@@ -109,11 +113,11 @@ canAssign (Grid cells size _) (Cell (cr,cc) cvalue) v
 
 
 -- iterate over the given group with the subFind function which tries to assign the current value to each cell in a given row
-find :: NBSem -> Grid -> Group -> [Char] -> IO (Maybe Grid)
-find _ grid _ [] = return (Just grid)
-find _ _ [] _ = return Nothing
-find sem grid group values =
-  foldr (subFind sem grid values) dowait group []
+find :: NBSem -> Int -> Grid -> Group -> [Char] -> IO (Maybe Grid)
+find _ _ grid _ [] = return (Just grid)
+find _ _ _ [] _ = return Nothing
+find sem depth grid group values =
+  foldr (subFind sem depth grid values) dowait group []
  where
    dowait as = loop as
 
@@ -129,21 +133,33 @@ find sem grid group values =
 
 -- Tries to assign the current value to a given cell. If it succeeds, we either move to the next row or the next value at top row.
 -- If it fails, we fall back to the find function which will try the next cell.
-subFind :: NBSem -> Grid -> [Char] -> Cell -> ([Async (Maybe Grid)] -> IO (Maybe Grid)) -> [Async (Maybe Grid)] -> IO (Maybe Grid)
-subFind sem grid@(Grid cells size rows) values@(v:vals) c@(Cell (row,col) _) inner asyncs = do
+subFind :: NBSem -> Int -> Grid -> [Char] -> Cell -> ([Async (Maybe Grid)] -> IO (Maybe Grid)) -> [Async (Maybe Grid)] -> IO (Maybe Grid)
+subFind sem depth grid@(Grid cells size rows) values@(v:vals) c@(Cell (row,col) _) inner asyncs = do
   case assignCell grid c v of
     Nothing -> inner asyncs
     Just g -> do
-      q <- tryAcquireNBSem sem
-      let nxt = row < size ^ 2 - 1
-      if q then do
-        let dofind | nxt = find sem g (map (cells !) $ rows ! (row + 1)) values `finally` releaseNBSem sem
-                   | otherwise = find sem g (map (cells !) $ rows ! 0) vals `finally` releaseNBSem sem
-        withAsync dofind $ \a -> inner (a:asyncs)
-      else do
-        g <- if nxt
-             then find sem g (map (cells !) $ rows ! (row + 1)) values
-             else find sem g (map (cells !) $ rows ! 0) vals
-        case g of
-          Nothing -> inner asyncs
-          Just _ -> return g
+      if depth > depthGate then do
+        q <- tryAcquireNBSem sem
+        if q then doAsync g
+        else doSync g
+      else doSync g
+
+ where
+   searchNextRow g = find sem depth g (map (cells !) $ rows ! (row + 1)) values
+
+   startNextVal g = find sem (depth + 1) g (map (cells !) $ rows ! 0) vals
+
+   nxt = row < size ^ 2 - 1
+
+   doAsync g = do
+     let dofind | nxt = searchNextRow g `finally` releaseNBSem sem
+                | otherwise = startNextVal g `finally` releaseNBSem sem
+     withAsync dofind $ \a -> inner (a:asyncs)
+
+   doSync g = do
+     g' <- if nxt
+           then searchNextRow g
+           else startNextVal g
+     case g' of
+       Nothing -> inner asyncs
+       Just _ -> return g'
